@@ -83,6 +83,7 @@ class StorageService {
     this.loadUserSession();
     this.startSimulation();
     if (isClient) {
+      void this.hydrateMapsConfigFromServer();
       void this.hydrateDatasetFromServer();
       void this.refreshCrowdOverlaysFromServer();
       if (this.settings.isSheetsConnected && this.settings.googleSheetsApiUrl) {
@@ -91,12 +92,30 @@ class StorageService {
     }
   }
 
+  private async hydrateMapsConfigFromServer() {
+    const currentKey = (this.settings.googleMapsApiKey || '').trim();
+    if (currentKey && currentKey !== 'YOUR_GOOGLE_MAPS_API_KEY') return;
+    try {
+      const resp = await fetch('/api/maps/config', { cache: 'no-store' });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const serverKey = typeof data?.googleMapsApiKey === 'string' ? data.googleMapsApiKey.trim() : '';
+      if (serverKey && serverKey !== 'YOUR_GOOGLE_MAPS_API_KEY') {
+        this.settings = { ...this.settings, googleMapsApiKey: serverKey };
+        this.notify();
+      }
+    } catch {
+      // Non-fatal fallback
+    }
+  }
+
   private loadSettings(): AppSettings {
     const saved = safeGetItem(STORAGE_KEYS.SETTINGS);
+    const envMapsKey = ((import.meta as any).env?.VITE_GOOGLE_MAPS_API_KEY || '').trim();
     const defaults: AppSettings = {
       googleSheetsApiUrl: '',
       isSheetsConnected: false,
-      googleMapsApiKey: (import.meta as any).env?.VITE_GOOGLE_MAPS_API_KEY || '',
+      googleMapsApiKey: envMapsKey,
       yoloFastApiUrl: 'http://localhost:8000/predict',
       simulationSpeedMultiplier: 1,
       simulationActive: true,
@@ -104,7 +123,14 @@ class StorageService {
     };
     if (saved) {
       try {
-        return { ...defaults, ...JSON.parse(saved) };
+        const parsed = JSON.parse(saved);
+        const merged = { ...defaults, ...parsed };
+        // Never allow an empty or placeholder saved value in localStorage to override a valid VITE_GOOGLE_MAPS_API_KEY
+        const savedKey = (merged.googleMapsApiKey || '').trim();
+        if ((!savedKey || savedKey === 'YOUR_GOOGLE_MAPS_API_KEY') && envMapsKey) {
+          merged.googleMapsApiKey = envMapsKey;
+        }
+        return merged;
       } catch (e) {
         return defaults;
       }

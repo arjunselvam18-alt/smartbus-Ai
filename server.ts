@@ -661,6 +661,21 @@ app.post('/api/sheets/verify-read-write', requireAdminAuth, async (req: Request,
   }
 });
 
+// --- Public Google Maps JavaScript SDK Key Config (Never exposes server-only secrets like GOOGLE_ROUTES_API_KEY) ---
+app.get('/api/maps/config', (_req: Request, res: Response): any => {
+  const publicMapsKey = (
+    process.env.VITE_GOOGLE_MAPS_API_KEY ||
+    process.env.GOOGLE_MAPS_API_KEY ||
+    ''
+  ).trim();
+  const validKey =
+    publicMapsKey && publicMapsKey !== 'YOUR_GOOGLE_MAPS_API_KEY' ? publicMapsKey : '';
+  return res.json({
+    configured: Boolean(validKey),
+    googleMapsApiKey: validKey,
+  });
+});
+
 // --- Google Maps Routes API Proxy Endpoint ---
 app.post('/api/routes/compute', async (req: Request, res: Response): Promise<any> => {
   try {

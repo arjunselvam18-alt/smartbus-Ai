@@ -146,6 +146,82 @@ const createBusSvgIcon = (
   return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
 };
 
+// Shared single-flight loader state for Google Maps JS SDK across component mounts/modals
+let googleMapsLoaderPromise: Promise<void> | null = null;
+let googleMapsLoaderKey: string | null = null;
+
+function isValidMapsKey(key?: string | null): key is string {
+  const k = (key || '').trim();
+  return Boolean(k && k !== 'YOUR_GOOGLE_MAPS_API_KEY' && k !== 'undefined' && k !== 'null');
+}
+
+function loadGoogleMapsSdk(apiKey: string): Promise<void> {
+  if (typeof window === 'undefined') {
+    return Promise.reject(new Error('Window is not available.'));
+  }
+  const win = window as any;
+  if (win.google?.maps?.Map) {
+    return Promise.resolve();
+  }
+  if (googleMapsLoaderPromise && googleMapsLoaderKey === apiKey) {
+    return googleMapsLoaderPromise;
+  }
+
+  googleMapsLoaderKey = apiKey;
+  googleMapsLoaderPromise = new Promise<void>((resolve, reject) => {
+    const scriptId = 'google-maps-js-sdk';
+    const existing = document.getElementById(scriptId) as HTMLScriptElement | null;
+
+    // Remove stale or errored script tag if key changed or previous attempt failed
+    if (existing) {
+      const existingSrc = existing.getAttribute('src') || '';
+      const hasSameKey = existingSrc.includes(`key=${encodeURIComponent(apiKey)}`);
+      if (!hasSameKey || existing.dataset.loadState === 'error') {
+        existing.remove();
+      } else if (existing.dataset.loadState === 'loaded' && win.google?.maps?.Map) {
+        resolve();
+        return;
+      } else {
+        // Script is already in-flight with matching key: attach listeners to existing tag
+        existing.addEventListener('load', () => resolve(), { once: true });
+        existing.addEventListener(
+          'error',
+          () => {
+            googleMapsLoaderPromise = null;
+            reject(new Error('Failed to load Google Maps script. Check your API key or network.'));
+          },
+          { once: true }
+        );
+        return;
+      }
+    }
+
+    const script = document.createElement('script');
+    script.id = scriptId;
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${encodeURIComponent(apiKey)}&libraries=geometry`;
+    script.async = true;
+    script.defer = true;
+    script.dataset.loadState = 'loading';
+    script.onload = () => {
+      script.dataset.loadState = 'loaded';
+      if (win.google?.maps?.Map) {
+        resolve();
+      } else {
+        googleMapsLoaderPromise = null;
+        reject(new Error('Google Maps JavaScript API initialized without Map constructor.'));
+      }
+    };
+    script.onerror = () => {
+      script.dataset.loadState = 'error';
+      googleMapsLoaderPromise = null;
+      reject(new Error('Failed to load Google Maps script. Check your API key or network.'));
+    };
+    document.head.appendChild(script);
+  });
+
+  return googleMapsLoaderPromise;
+}
+
 export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
   buses,
   routes,
@@ -158,6 +234,7 @@ export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
   onClearPlannedJourney,
 }) => {
   const mapContainerRef = useRef<HTMLDivElement>(null);
+  const [runtimeEnvApiKey, setRuntimeEnvApiKey] = useState<string>('');
   const [googleMapLoaded, setGoogleMapLoaded] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const mapInstanceRef = useRef<any>(null);
@@ -522,33 +599,133 @@ export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
     };
   }, [plannedJourney, relevantRoutes, stops, currentActiveRouteNumber]);
 
-  // Try loading official Google Maps JavaScript API if API Key is configured
+  const buildEnvApiKey = ((import.meta as any).env?.VITE_GOOGLE_MAPS_API_KEY || '').trim();
+  const effectiveApiKey = isValidMapsKey(apiKey)
+    ? apiKey.trim()
+    : isValidMapsKey(buildEnvApiKey)
+      ? buildEnvApiKey
+      : isValidMapsKey(runtimeEnvApiKey)
+        ? runtimeEnvApiKey.trim()
+        : '';
+
+  // Runtime fallback lookup via /api/maps/config if VITE_GOOGLE_MAPS_API_KEY was not baked at build time
   useEffect(() => {
-    if (!apiKey || apiKey === 'YOUR_GOOGLE_MAPS_API_KEY') {
+    if (effectiveApiKey) return;
+    let active = true;
+    fetch('/api/maps/config', { cache: 'no-store' })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => {
+        if (!active || !data) return;
+        if (data.configured && isValidMapsKey(data.googleMapsApiKey)) {
+          setRuntimeEnvApiKey(data.googleMapsApiKey.trim());
+        }
+      })
+      .catch(() => {
+        // Non-fatal fallback
+      });
+    return () => {
+      active = false;
+    };
+  }, [effectiveApiKey]);
+
+  // Listen for Google Maps JavaScript API auth / domain referrer errors without listener collisions
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const win = window as any;
+    const origin = window.location.origin;
+    const EVENT_NAME = 'smartbus-gmp-auth-error';
+
+    if (!win.__smartbusGmpListenersInstalled) {
+      win.__smartbusGmpListenersInstalled = true;
+      const prevAuthFailure = win.gm_authFailure;
+      win.gm_authFailure = () => {
+        window.dispatchEvent(
+          new CustomEvent(EVENT_NAME, {
+            detail: {
+              message: `Google Maps authentication failed on ${window.location.origin}. Verify VITE_GOOGLE_MAPS_API_KEY is valid, Maps JavaScript API is enabled, and HTTP referrer restrictions allow ${window.location.origin}/* (or https://*.vercel.app/*).`,
+            },
+          })
+        );
+        if (typeof prevAuthFailure === 'function') {
+          prevAuthFailure();
+        }
+      };
+
+      const origConsoleError = console.error;
+      console.error = (...args: unknown[]) => {
+        origConsoleError.apply(console, args);
+        const msg = args.map((a) => String(a ?? '')).join(' ');
+        if (msg.includes('RefererNotAllowedMapError')) {
+          window.dispatchEvent(
+            new CustomEvent(EVENT_NAME, {
+              detail: {
+                message: `Google Maps key referrer restriction blocked ${window.location.origin}. Add "${window.location.origin}/*" to your Google Cloud API key HTTP referrers.`,
+              },
+            })
+          );
+        } else if (msg.includes('ApiNotActivatedMapError')) {
+          window.dispatchEvent(
+            new CustomEvent(EVENT_NAME, {
+              detail: {
+                message:
+                  'Maps JavaScript API is not enabled on the Google Cloud project for VITE_GOOGLE_MAPS_API_KEY.',
+              },
+            })
+          );
+        } else if (msg.includes('InvalidKeyMapError') || msg.includes('MissingKeyMapError')) {
+          window.dispatchEvent(
+            new CustomEvent(EVENT_NAME, {
+              detail: {
+                message: 'Invalid or missing Google Maps JavaScript API key (VITE_GOOGLE_MAPS_API_KEY).',
+              },
+            })
+          );
+        }
+      };
+    }
+
+    const handleGmpAuthError = (ev: Event) => {
+      const detail = (ev as CustomEvent<{ message?: string }>).detail;
+      setLoadError(
+        detail?.message ||
+          `Google Maps JavaScript API authorization error on ${origin}. Check key restrictions.`
+      );
+      setGoogleMapLoaded(false);
+    };
+
+    window.addEventListener(EVENT_NAME, handleGmpAuthError);
+    return () => {
+      window.removeEventListener(EVENT_NAME, handleGmpAuthError);
+    };
+  }, []);
+
+  // Load official Google Maps JavaScript API using shared single-flight loader
+  useEffect(() => {
+    if (!effectiveApiKey) {
       setGoogleMapLoaded(false);
       return;
     }
 
-    if ((window as any).google && (window as any).google.maps) {
-      setGoogleMapLoaded(true);
-      return;
-    }
+    let cancelled = false;
+    setLoadError(null);
 
-    const scriptId = 'google-maps-js-sdk';
-    if (!document.getElementById(scriptId)) {
-      const script = document.createElement('script');
-      script.id = scriptId;
-      script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&libraries=geometry`;
-      script.async = true;
-      script.defer = true;
-      script.onload = () => setGoogleMapLoaded(true);
-      script.onerror = () => {
-        setLoadError('Failed to load Google Maps script. Check your API key or network.');
-        setGoogleMapLoaded(false);
-      };
-      document.head.appendChild(script);
-    }
-  }, [apiKey]);
+    loadGoogleMapsSdk(effectiveApiKey)
+      .then(() => {
+        if (!cancelled) {
+          setGoogleMapLoaded(true);
+        }
+      })
+      .catch((err: any) => {
+        if (!cancelled) {
+          setLoadError(err?.message || 'Failed to load Google Maps script. Check your API key or network.');
+          setGoogleMapLoaded(false);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveApiKey]);
 
   // Journey key identifier to detect when a completely new journey is searched
   const currentJourneyKey = useMemo(() => {
@@ -624,7 +801,7 @@ export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
       origin,
       destination,
       intermediates,
-      apiKey,
+      apiKey: effectiveApiKey || undefined,
       cacheKey,
       signal,
     })
@@ -719,46 +896,89 @@ export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
     return () => {
       isMounted = false;
     };
-  }, [currentJourneyKey, activeBusRoute?.id, apiKey, plannedJourney, corridorRoutes]);
+  }, [currentJourneyKey, activeBusRoute?.id, effectiveApiKey, plannedJourney, corridorRoutes]);
 
   // 1. Initialize Google Maps instance ONCE when script and container are ready
   useEffect(() => {
-    if (!googleMapLoaded || !mapContainerRef.current || !(window as any).google) return;
-    if (mapInstanceRef.current) return; // Keep map instance stable - never recreate or remount!
-
-    try {
-      const google = (window as any).google;
-      const initialCenter = activeBus
-        ? { lat: activeBus.latitude, lng: activeBus.longitude }
-        : { lat: 13.01, lng: 80.22 };
-
-      const map = new google.maps.Map(mapContainerRef.current, {
-        center: initialCenter,
-        zoom: 13,
-        mapTypeId: 'roadmap',
-        mapTypeControl: true,
-        streetViewControl: false,
-        fullscreenControl: true,
-        zoomControl: true,
-        gestureHandling: 'greedy', // Ensures smooth mouse-wheel, touch-zoom, and drag-to-pan
-        styles: [
-          { featureType: 'administrative', elementType: 'geometry', stylers: [{ visibility: 'off' }] },
-          { featureType: 'poi.park', elementType: 'geometry', stylers: [{ color: '#ceead6' }] },
-          { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#aadaff' }] },
-          { featureType: 'road.highway', elementType: 'geometry.fill', stylers: [{ color: '#ffffff' }] },
-          { featureType: 'road.highway', elementType: 'geometry.stroke', stylers: [{ color: '#d0d7de' }, { weight: 1.5 }] },
-          { featureType: 'road.arterial', elementType: 'geometry.fill', stylers: [{ color: '#ffffff' }] },
-          { featureType: 'road.local', elementType: 'geometry.fill', stylers: [{ color: '#ffffff' }] },
-          { featureType: 'transit.line', elementType: 'geometry', stylers: [{ color: '#bdc1c6' }] },
-          { featureType: 'transit.station.bus', elementType: 'labels.icon', stylers: [{ visibility: 'on' }] },
-        ],
-      });
-
-      infoWindowRef.current = new google.maps.InfoWindow();
-      mapInstanceRef.current = map;
-    } catch (e) {
-      console.error('Google Maps initialization error:', e);
+    if (!googleMapLoaded || !mapContainerRef.current || !(window as any).google?.maps) {
+      return;
     }
+
+    const containerEl = mapContainerRef.current;
+    const google = (window as any).google;
+
+    if (!mapInstanceRef.current) {
+      try {
+        const initialCenter = activeBus
+          ? { lat: activeBus.latitude, lng: activeBus.longitude }
+          : { lat: 13.01, lng: 80.22 };
+
+        const map = new google.maps.Map(containerEl, {
+          center: initialCenter,
+          zoom: 13,
+          mapTypeId: 'roadmap',
+          mapTypeControl: true,
+          streetViewControl: false,
+          fullscreenControl: true,
+          zoomControl: true,
+          gestureHandling: 'greedy', // Ensures smooth mouse-wheel, touch-zoom, and drag-to-pan
+          internalUsageAttributionIds: ['gmp_mcp_codeassist_v1_aistudio'],
+          styles: [
+            { featureType: 'administrative', elementType: 'geometry', stylers: [{ visibility: 'off' }] },
+            { featureType: 'poi.park', elementType: 'geometry', stylers: [{ color: '#ceead6' }] },
+            { featureType: 'water', elementType: 'geometry', stylers: [{ color: '#aadaff' }] },
+            { featureType: 'road.highway', elementType: 'geometry.fill', stylers: [{ color: '#ffffff' }] },
+            { featureType: 'road.highway', elementType: 'geometry.stroke', stylers: [{ color: '#d0d7de' }, { weight: 1.5 }] },
+            { featureType: 'road.arterial', elementType: 'geometry.fill', stylers: [{ color: '#ffffff' }] },
+            { featureType: 'road.local', elementType: 'geometry.fill', stylers: [{ color: '#ffffff' }] },
+            { featureType: 'transit.line', elementType: 'geometry', stylers: [{ color: '#bdc1c6' }] },
+            { featureType: 'transit.station.bus', elementType: 'labels.icon', stylers: [{ visibility: 'on' }] },
+          ],
+        });
+
+        infoWindowRef.current = new google.maps.InfoWindow();
+        mapInstanceRef.current = map;
+
+        // Ensure crisp tiles immediately when mounted inside tabs or modals
+        requestAnimationFrame(() => {
+          if (mapInstanceRef.current && (window as any).google?.maps?.event) {
+            (window as any).google.maps.event.trigger(mapInstanceRef.current, 'resize');
+          }
+        });
+      } catch (e) {
+        console.error('Google Maps initialization error:', e);
+      }
+    }
+
+    let resizeObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined' && mapInstanceRef.current) {
+      resizeObserver = new ResizeObserver(() => {
+        if (mapInstanceRef.current && (window as any).google?.maps?.event) {
+          (window as any).google.maps.event.trigger(mapInstanceRef.current, 'resize');
+        }
+      });
+      resizeObserver.observe(containerEl);
+    }
+
+    return () => {
+      if (resizeObserver) {
+        resizeObserver.disconnect();
+      }
+      routePolylinesRef.current.forEach((p) => p.setMap(null));
+      routePolylinesRef.current = [];
+      stopMarkersRef.current.forEach((m) => m.setMap(null));
+      stopMarkersRef.current.clear();
+      busMarkersRef.current.forEach((m) => m.setMap(null));
+      busMarkersRef.current.clear();
+      busClickHandlersRef.current.clear();
+      if (infoWindowRef.current) {
+        infoWindowRef.current.close();
+        infoWindowRef.current = null;
+      }
+      mapInstanceRef.current = null;
+      initialFitDoneRef.current = false;
+      lastFittedJourneyKeyRef.current = null;
+    };
   }, [googleMapLoaded]);
 
   // 2. Camera Viewport Management: Fit bounds ONLY on initial load or when a NEW journey is searched
@@ -1334,9 +1554,23 @@ export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
           </div>
         </div>
 
+        {/* Diagnostic Banner if Google Maps JavaScript API failed to load or authorize on current domain */}
+        {loadError && (
+          <div className="absolute top-16 left-3.5 right-3.5 z-20 p-2.5 bg-rose-50/95 backdrop-blur border border-rose-300 rounded-xl shadow-md flex items-start gap-2 text-xs text-rose-900">
+            <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+            <div className="leading-tight">
+              <strong>Google Maps JavaScript API Notice:</strong> {loadError}
+            </div>
+          </div>
+        )}
+
         {/* Warning Banner when stops cannot be resolved or have missing coordinates */}
         {invalidStopsList.length > 0 && (
-          <div className="absolute top-16 left-3.5 right-3.5 z-20 p-2.5 bg-amber-50/95 backdrop-blur border border-amber-300 rounded-xl shadow-md flex items-start gap-2 text-xs text-amber-900">
+          <div
+            className={`absolute ${
+              loadError ? 'top-28' : 'top-16'
+            } left-3.5 right-3.5 z-20 p-2.5 bg-amber-50/95 backdrop-blur border border-amber-300 rounded-xl shadow-md flex items-start gap-2 text-xs text-amber-900`}
+          >
             <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
             <div className="leading-tight">
               <strong>Coordinate Integrity Notice:</strong>{' '}
@@ -1351,7 +1585,11 @@ export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
         {(plannedJourney || selectedRouteId) && relevantBuses.length === 0 && (
           <div
             className={`absolute ${
-              invalidStopsList.length > 0 ? 'top-28' : 'top-16'
+              loadError && invalidStopsList.length > 0
+                ? 'top-40'
+                : loadError || invalidStopsList.length > 0
+                  ? 'top-28'
+                  : 'top-16'
             } left-3.5 z-20 px-3.5 py-2.5 bg-amber-50/95 backdrop-blur border border-amber-300 rounded-xl shadow-md flex items-center gap-2 text-xs font-semibold text-amber-900 max-w-md`}
           >
             <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />

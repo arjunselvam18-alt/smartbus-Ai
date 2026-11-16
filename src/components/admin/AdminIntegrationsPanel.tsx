@@ -110,6 +110,24 @@ export const AdminIntegrationsPanel: React.FC<AdminIntegrationsPanelProps> = ({
   };
 
   useEffect(() => {
+    const jsLoaded = typeof window !== 'undefined' && Boolean((window as any).google?.maps);
+    const keyConfigured = Boolean(
+      snapshot?.googleMaps.configured ||
+      (settings.googleMapsApiKey && settings.googleMapsApiKey !== 'YOUR_GOOGLE_MAPS_API_KEY')
+    );
+    setMapsRuntimeCheck((prev) => ({
+      ...prev,
+      jsLoaded,
+      keyConfigured,
+      message: jsLoaded
+        ? 'Google Maps JavaScript API is active and responding in the runtime.'
+        : keyConfigured
+        ? 'Google Maps API key is configured; JavaScript SDK initializes when the map view opens.'
+        : 'Google Maps JavaScript API key is not detected. Configure VITE_GOOGLE_MAPS_API_KEY in Vercel and redeploy.',
+    }));
+  }, [settings.googleMapsApiKey, snapshot?.googleMaps.configured]);
+
+  useEffect(() => {
     if (hasAdminToken) {
       void loadSnapshot();
     }
