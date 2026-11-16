@@ -4,7 +4,7 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "functions": {
-    "api/[...path].ts": {
+    "api/index.ts": {
       "includeFiles": "public/assets/**",
       "maxDuration": 30
     }
@@ -18,6 +18,10 @@
     }
   ],
   "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index?__api_path=$1"
+    },
     {
       "source": "/((?!api/|assets/|favicon\\.ico).*)",
       "destination": "/index.html"

@@ -9,7 +9,7 @@ import {
   issueAdminToken,
   registerStaffRoutes,
   requireAdminAuth,
-} from './serverStaffRegistry';
+} from './serverStaffRegistry.js';
 
 dotenv.config();
 
@@ -131,6 +131,29 @@ function initializeUsersStore() {
 }
 initializeUsersStore();
 
+function parseJsonBody(req: Request): Record<string, any> {
+  if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) {
+    return req.body;
+  }
+  if (Buffer.isBuffer(req.body)) {
+    try {
+      const parsed = JSON.parse(req.body.toString('utf8'));
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  if (typeof req.body === 'string' && req.body.trim()) {
+    try {
+      const parsed = JSON.parse(req.body);
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
 // --- Auth Endpoints ---
 app.get('/api/auth/admin-setup-status', (_req: Request, res: Response): any => {
   return res.json({
@@ -148,7 +171,7 @@ app.post('/api/auth/setup-initial-admin', (req: Request, res: Response): any => 
       });
     }
 
-    const { email, password, confirmPassword, name, setupToken } = req.body || {};
+    const { email, password, confirmPassword, name, setupToken } = parseJsonBody(req);
 
     const requiredSetupToken = (process.env.ADMIN_SETUP_TOKEN || '').trim();
     if (requiredSetupToken) {
@@ -217,28 +240,36 @@ app.post('/api/auth/setup-initial-admin', (req: Request, res: Response): any => 
 
 app.post('/api/auth/register', (req: Request, res: Response): any => {
   try {
-    const { email, password, name } = req.body;
-    if (!email || !password || !name) {
+    const { email, password, name } = parseJsonBody(req);
+    const emailStr = typeof email === 'string' ? email : '';
+    const passwordStr = typeof password === 'string' ? password : '';
+    const nameStr = typeof name === 'string' ? name : '';
+
+    if (!emailStr.trim() || !passwordStr || !nameStr.trim()) {
       return res.status(400).json({ error: 'Email, password, and name are required.' });
     }
 
-    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedEmail = emailStr.toLowerCase().trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
+      return res.status(400).json({ error: 'Please enter a valid email address.' });
+    }
+
     if (usersDb.has(normalizedEmail)) {
       return res.status(400).json({ error: 'An account with this email already exists.' });
     }
 
-    if (password.length < 6) {
+    if (passwordStr.length < 6) {
       return res.status(400).json({ error: 'Password must be at least 6 characters long.' });
     }
 
     const salt = crypto.randomBytes(16).toString('hex');
-    const passwordHash = hashPassword(password, salt);
+    const passwordHash = hashPassword(passwordStr, salt);
 
     // Public registration is strictly limited to Passenger role (never allows Admin self-registration)
     const newUser: StoredUser = {
       id: `usr_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`,
       email: normalizedEmail,
-      name: name.trim(),
+      name: nameStr.trim(),
       role: 'passenger',
       salt,
       passwordHash,
@@ -269,12 +300,15 @@ app.post('/api/auth/register', (req: Request, res: Response): any => {
 
 app.post('/api/auth/login', (req: Request, res: Response): any => {
   try {
-    const { email, password } = req.body;
-    if (!email || !password) {
+    const { email, password } = parseJsonBody(req);
+    const emailStr = typeof email === 'string' ? email : '';
+    const passwordStr = typeof password === 'string' ? password : '';
+
+    if (!emailStr.trim() || !passwordStr) {
       return res.status(400).json({ error: 'Please enter both email and password.' });
     }
 
-    const normalizedEmail = email.toLowerCase().trim();
+    const normalizedEmail = emailStr.toLowerCase().trim();
     const user = usersDb.get(normalizedEmail);
 
     if (!user) {
@@ -285,7 +319,7 @@ app.post('/api/auth/login', (req: Request, res: Response): any => {
       return res.status(403).json({ error: 'Your account has been suspended by an administrator.' });
     }
 
-    const inputHash = hashPassword(password, user.salt);
+    const inputHash = hashPassword(passwordStr, user.salt);
     if (inputHash !== user.passwordHash) {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }
@@ -1336,6 +1370,34 @@ Provide a concise, helpful answer (2-3 paragraphs max) with practical guidance f
   } catch (e: any) {
     return res.status(500).json({ error: e.message });
   }
+});
+
+// Ensure unmatched /api/* routes always return JSON (never Express default HTML or SPA index.html)
+app.all('/api/*', (_req: Request, res: Response): any => {
+  return res.status(404).json({ error: 'API endpoint not found.' });
+});
+
+// Global JSON error handler for /api/* (e.g., malformed JSON body or unhandled serverless errors)
+app.use((err: any, req: Request, res: Response, next: express.NextFunction): any => {
+  if (req.path.startsWith('/api/') || req.url.startsWith('/api/')) {
+    if (res.headersSent) {
+      return next(err);
+    }
+    const status =
+      typeof err?.status === 'number' && err.status >= 400 && err.status < 600
+        ? err.status
+        : typeof err?.statusCode === 'number' && err.statusCode >= 400 && err.statusCode < 600
+          ? err.statusCode
+          : 500;
+    const message =
+      err?.type === 'entity.parse.failed'
+        ? 'Invalid JSON request payload.'
+        : err?.type === 'entity.too.large'
+          ? 'Request payload is too large.'
+          : err?.message || 'Internal server error.';
+    return res.status(status).json({ error: message });
+  }
+  return next(err);
 });
 
 // --- Dev & Production Server Mounting ---

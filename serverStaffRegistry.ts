@@ -104,7 +104,7 @@ export interface StaffCrowdAuditEntry {
 }
 
 // Ephemeral server-only HMAC signing secret (generated per process if env var is unset)
-const TOKEN_SECRET = process.env.SMARTBUS_AUTH_SECRET || crypto.randomBytes(32).toString('hex');
+const TOKEN_SECRET = (process.env.SMARTBUS_AUTH_SECRET || '').trim() || crypto.randomBytes(32).toString('hex');
 
 const staffRegistry = new Map<string, InternalStaffRecord>(); // key: internal id
 const staffByCode = new Map<string, string>(); // normalized staffId -> internal id
@@ -140,7 +140,7 @@ setInterval(() => {
       otpChallenges.delete(code);
     }
   });
-}, 60 * 1000);
+}, 60 * 1000).unref();
 
 function normalizeStaffId(id: string): string {
   return String(id || '').trim().toUpperCase();
