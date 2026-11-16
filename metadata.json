@@ -1,0 +1,6 @@
+{
+  "name": "SmartBus AI",
+  "description": "Intelligent Public Bus Crowd Monitoring & Tracking System with live Google Maps tracking, AI passenger detection, crowd level classification, and Google Sheets integration.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
