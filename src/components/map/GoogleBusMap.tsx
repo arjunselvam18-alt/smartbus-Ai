@@ -160,7 +160,7 @@ function loadGoogleMapsSdk(apiKey: string): Promise<void> {
     return Promise.reject(new Error('Window is not available.'));
   }
   const win = window as any;
-  if (win.google?.maps?.Map) {
+  if (win.google?.maps?.Map && googleMapsLoaderKey === apiKey) {
     return Promise.resolve();
   }
   if (googleMapsLoaderPromise && googleMapsLoaderKey === apiKey) {
@@ -613,15 +613,27 @@ export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
     if (effectiveApiKey) return;
     let active = true;
     fetch('/api/maps/config', { cache: 'no-store' })
-      .then((res) => (res.ok ? res.json() : null))
+      .then(async (res) => {
+        if (!res.ok) {
+          throw new Error(`/api/maps/config returned HTTP ${res.status}`);
+        }
+        return res.json();
+      })
       .then((data) => {
         if (!active || !data) return;
         if (data.configured && isValidMapsKey(data.googleMapsApiKey)) {
           setRuntimeEnvApiKey(data.googleMapsApiKey.trim());
+        } else {
+          const msg = `Google Maps JavaScript API key is not configured on ${window.location.origin} (/api/maps/config returned configured: false). Add VITE_GOOGLE_MAPS_API_KEY in Vercel Environment Variables (Production) and redeploy.`;
+          console.warn('[SmartBus Maps]', msg);
+          setLoadError((prev) => prev || msg);
         }
       })
-      .catch(() => {
-        // Non-fatal fallback
+      .catch((err) => {
+        if (!active) return;
+        const msg = `Unable to fetch /api/maps/config (${err?.message || 'network error'}) and VITE_GOOGLE_MAPS_API_KEY is not present in the frontend build.`;
+        console.warn('[SmartBus Maps]', msg);
+        setLoadError((prev) => prev || msg);
       });
     return () => {
       active = false;
@@ -642,6 +654,7 @@ export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
         window.dispatchEvent(
           new CustomEvent(EVENT_NAME, {
             detail: {
+              specific: false,
               message: `Google Maps authentication failed on ${window.location.origin}. Verify VITE_GOOGLE_MAPS_API_KEY is valid, Maps JavaScript API is enabled, and HTTP referrer restrictions allow ${window.location.origin}/* (or https://*.vercel.app/*).`,
             },
           })
@@ -659,7 +672,8 @@ export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
           window.dispatchEvent(
             new CustomEvent(EVENT_NAME, {
               detail: {
-                message: `Google Maps key referrer restriction blocked ${window.location.origin}. Add "${window.location.origin}/*" to your Google Cloud API key HTTP referrers.`,
+                specific: true,
+                message: `Google Maps key referrer restriction blocked ${window.location.origin} (RefererNotAllowedMapError). Add "${window.location.origin}/*" to your Google Cloud API key HTTP referrers.`,
               },
             })
           );
@@ -667,8 +681,9 @@ export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
           window.dispatchEvent(
             new CustomEvent(EVENT_NAME, {
               detail: {
+                specific: true,
                 message:
-                  'Maps JavaScript API is not enabled on the Google Cloud project for VITE_GOOGLE_MAPS_API_KEY.',
+                  'Maps JavaScript API is not enabled on the Google Cloud project for VITE_GOOGLE_MAPS_API_KEY (ApiNotActivatedMapError).',
               },
             })
           );
@@ -676,7 +691,17 @@ export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
           window.dispatchEvent(
             new CustomEvent(EVENT_NAME, {
               detail: {
+                specific: true,
                 message: 'Invalid or missing Google Maps JavaScript API key (VITE_GOOGLE_MAPS_API_KEY).',
+              },
+            })
+          );
+        } else if (msg.includes('BillingNotEnabledMapError')) {
+          window.dispatchEvent(
+            new CustomEvent(EVENT_NAME, {
+              detail: {
+                specific: true,
+                message: 'Google Cloud billing is not enabled for the Maps JavaScript API project (BillingNotEnabledMapError).',
               },
             })
           );
@@ -685,11 +710,16 @@ export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
     }
 
     const handleGmpAuthError = (ev: Event) => {
-      const detail = (ev as CustomEvent<{ message?: string }>).detail;
-      setLoadError(
-        detail?.message ||
+      const detail = (ev as CustomEvent<{ message?: string; specific?: boolean }>).detail;
+      setLoadError((prev) => {
+        if (!detail?.specific && prev && prev.includes('MapError')) {
+          return prev;
+        }
+        return (
+          detail?.message ||
           `Google Maps JavaScript API authorization error on ${origin}. Check key restrictions.`
-      );
+        );
+      });
       setGoogleMapLoaded(false);
     };
 
@@ -945,8 +975,10 @@ export const GoogleBusMap: React.FC<GoogleBusMapProps> = ({
             (window as any).google.maps.event.trigger(mapInstanceRef.current, 'resize');
           }
         });
-      } catch (e) {
+      } catch (e: any) {
         console.error('Google Maps initialization error:', e);
+        setLoadError(e?.message || 'Google Maps failed to initialize in the map container.');
+        setGoogleMapLoaded(false);
       }
     }
 

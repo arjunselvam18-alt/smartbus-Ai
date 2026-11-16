@@ -93,14 +93,20 @@ class StorageService {
   }
 
   private async hydrateMapsConfigFromServer() {
-    const currentKey = (this.settings.googleMapsApiKey || '').trim();
-    if (currentKey && currentKey !== 'YOUR_GOOGLE_MAPS_API_KEY') return;
+    const envMapsKey = ((import.meta as any).env?.VITE_GOOGLE_MAPS_API_KEY || '').trim();
+    if (envMapsKey && envMapsKey !== 'YOUR_GOOGLE_MAPS_API_KEY') return;
     try {
       const resp = await fetch('/api/maps/config', { cache: 'no-store' });
       if (!resp.ok) return;
       const data = await resp.json();
       const serverKey = typeof data?.googleMapsApiKey === 'string' ? data.googleMapsApiKey.trim() : '';
-      if (serverKey && serverKey !== 'YOUR_GOOGLE_MAPS_API_KEY') {
+      if (
+        serverKey &&
+        serverKey !== 'YOUR_GOOGLE_MAPS_API_KEY' &&
+        serverKey !== 'undefined' &&
+        serverKey !== 'null' &&
+        serverKey !== this.settings.googleMapsApiKey
+      ) {
         this.settings = { ...this.settings, googleMapsApiKey: serverKey };
         this.notify();
       }
@@ -112,10 +118,14 @@ class StorageService {
   private loadSettings(): AppSettings {
     const saved = safeGetItem(STORAGE_KEYS.SETTINGS);
     const envMapsKey = ((import.meta as any).env?.VITE_GOOGLE_MAPS_API_KEY || '').trim();
+    const validEnvKey =
+      envMapsKey && envMapsKey !== 'YOUR_GOOGLE_MAPS_API_KEY' && envMapsKey !== 'undefined' && envMapsKey !== 'null'
+        ? envMapsKey
+        : '';
     const defaults: AppSettings = {
       googleSheetsApiUrl: '',
       isSheetsConnected: false,
-      googleMapsApiKey: envMapsKey,
+      googleMapsApiKey: validEnvKey,
       yoloFastApiUrl: 'http://localhost:8000/predict',
       simulationSpeedMultiplier: 1,
       simulationActive: true,
@@ -125,10 +135,14 @@ class StorageService {
       try {
         const parsed = JSON.parse(saved);
         const merged = { ...defaults, ...parsed };
-        // Never allow an empty or placeholder saved value in localStorage to override a valid VITE_GOOGLE_MAPS_API_KEY
-        const savedKey = (merged.googleMapsApiKey || '').trim();
-        if ((!savedKey || savedKey === 'YOUR_GOOGLE_MAPS_API_KEY') && envMapsKey) {
-          merged.googleMapsApiKey = envMapsKey;
+        // Build/server env key must always supersede stale or placeholder localStorage values
+        if (validEnvKey) {
+          merged.googleMapsApiKey = validEnvKey;
+        } else {
+          const savedKey = (merged.googleMapsApiKey || '').trim();
+          if (!savedKey || savedKey === 'YOUR_GOOGLE_MAPS_API_KEY' || savedKey === 'undefined' || savedKey === 'null') {
+            merged.googleMapsApiKey = '';
+          }
         }
         return merged;
       } catch (e) {
@@ -824,7 +838,11 @@ class StorageService {
 
   public updateSettings(partial: Partial<AppSettings>) {
     this.settings = { ...this.settings, ...partial };
-    safeSetItem(STORAGE_KEYS.SETTINGS, JSON.stringify(this.settings));
+    const toPersist: Partial<AppSettings> = { ...this.settings };
+    if (partial.googleMapsApiKey === undefined) {
+      delete toPersist.googleMapsApiKey;
+    }
+    safeSetItem(STORAGE_KEYS.SETTINGS, JSON.stringify(toPersist));
     this.notify();
   }
 

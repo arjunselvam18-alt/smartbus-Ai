@@ -663,16 +663,23 @@ app.post('/api/sheets/verify-read-write', requireAdminAuth, async (req: Request,
 
 // --- Public Google Maps JavaScript SDK Key Config (Never exposes server-only secrets like GOOGLE_ROUTES_API_KEY) ---
 app.get('/api/maps/config', (_req: Request, res: Response): any => {
-  const publicMapsKey = (
-    process.env.VITE_GOOGLE_MAPS_API_KEY ||
-    process.env.GOOGLE_MAPS_API_KEY ||
-    ''
-  ).trim();
-  const validKey =
-    publicMapsKey && publicMapsKey !== 'YOUR_GOOGLE_MAPS_API_KEY' ? publicMapsKey : '';
+  res.setHeader('Cache-Control', 'no-store, max-age=0');
+  const viteKey = (process.env.VITE_GOOGLE_MAPS_API_KEY || '').trim();
+  const fallbackKey = (process.env.GOOGLE_MAPS_API_KEY || '').trim();
+  const isRealKey = (k: string) =>
+    Boolean(k && k !== 'YOUR_GOOGLE_MAPS_API_KEY' && k !== 'undefined' && k !== 'null');
+
+  const validKey = isRealKey(viteKey) ? viteKey : isRealKey(fallbackKey) ? fallbackKey : '';
+  const source = isRealKey(viteKey)
+    ? 'VITE_GOOGLE_MAPS_API_KEY'
+    : isRealKey(fallbackKey)
+      ? 'GOOGLE_MAPS_API_KEY'
+      : 'none';
+
   return res.json({
     configured: Boolean(validKey),
     googleMapsApiKey: validKey,
+    source,
   });
 });
 
